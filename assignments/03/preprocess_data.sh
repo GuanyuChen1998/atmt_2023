@@ -4,7 +4,9 @@
 set -e
 
 pwd=`dirname "$(readlink -f "$0")"`
-base=$pwd/../..
+parentdir="$(dirname "$dir")"
+#base=$pwd/../..
+base="$(dirname "$parentdir")"
 src=fr
 tgt=en
 data=$base/data/$tgt-$src/
