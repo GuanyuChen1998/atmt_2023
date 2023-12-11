@@ -3,6 +3,7 @@ import logging
 import argparse
 import numpy as np
 from tqdm import tqdm
+from copy import deepcopy
 
 import torch
 from torch.serialization import default_restore_location
@@ -33,6 +34,14 @@ def get_args():
     # alpha hyperparameter for length normalization (described as lp in https://arxiv.org/pdf/1609.08144.pdf equation 14)
     parser.add_argument('--alpha', default=0.0, type=float, help='alpha for softer length normalization')
 
+    parser.add_argument('--lambda-reg', default=0.5, type=float, help='lambda_reg for square regularizer')
+
+    parser.add_argument('--diverse-beam', default=False, help='diverse beam search')
+
+    parser.add_argument('--N-best', default=3, type=int, help='number of best outputs of beam search')
+
+    parser.add_argument('--gamma', default=0, type=float, help='gamma for diverse beam search')
+
     return parser.parse_args()
 
 
@@ -57,6 +66,7 @@ def main(args):
         tgt_file=os.path.join(args.data, 'test.{:s}'.format(args.target_lang)),
         src_dict=src_dict, tgt_dict=tgt_dict)
 
+
     test_loader = torch.utils.data.DataLoader(test_dataset, num_workers=1, collate_fn=test_dataset.collater,
                                               batch_sampler=BatchSampler(test_dataset, 9999999,
                                                                          args.batch_size, 1, 0, shuffle=False,
@@ -72,6 +82,7 @@ def main(args):
 
     # Iterate over the test set
     all_hyps = {}
+    all_hyps_best_n = [{} for _ in range(args.N_best)]
     for i, sample in enumerate(progress_bar):
 
         # Create a beam search object or every input sentence in batch
@@ -106,6 +117,7 @@ def main(args):
                 next_word = torch.where(best_candidate == tgt_dict.unk_idx, backoff_candidate, best_candidate)
                 log_p = torch.where(best_candidate == tgt_dict.unk_idx, backoff_log_p, best_log_p)
                 log_p = log_p[-1]
+                r_square = log_p ** 2
 
                 # Store the encoder_out information for the current input sentence and beam
                 emb = encoder_out['src_embeddings'][:,i,:]
@@ -118,9 +130,9 @@ def main(args):
                     mask = None
 
                 node = BeamSearchNode(searches[i], emb, lstm_out, final_hidden, final_cell,
-                                      mask, torch.cat((go_slice[i], next_word)), log_p, 1)
+                                      mask, torch.cat((go_slice[i], next_word)), log_p, 1, r_square, args.lambda_reg)
                 # __QUESTION 3: Why do we add the node with a negative score?
-                searches[i].add(-node.eval(args.alpha), node)
+                searches[i].add(-node.eval(args.alpha)-(j+1)*args.gamma, node)
 
         #import pdb;pdb.set_trace()
         # Start generating further tokens until max sentence length reached
@@ -143,12 +155,16 @@ def main(args):
             except TypeError:
                 encoder_out["src_mask"] = None
 
+
+
             with torch.no_grad():
                 # Compute the decoder output by feeding it the decoded sentence prefix
                 decoder_out, _ = model.decoder(prev_words, encoder_out)
+            
 
             # see __QUESTION 2
             log_probs, next_candidates = torch.topk(torch.log(torch.softmax(decoder_out, dim=2)), args.beam_size+1, dim=-1)
+
 
             # Create number of beam_size next nodes for every current node
             for i in range(log_probs.shape[0]):
@@ -161,6 +177,8 @@ def main(args):
                     next_word = torch.where(best_candidate == tgt_dict.unk_idx, backoff_candidate, best_candidate)
                     log_p = torch.where(best_candidate == tgt_dict.unk_idx, backoff_log_p, best_log_p)
                     log_p = log_p[-1]
+                    r_square = log_p ** 2
+                    
                     next_word = torch.cat((prev_words[i][1:], next_word[-1:]))
 
                     # Get parent node and beam search object for corresponding sentence
@@ -175,18 +193,18 @@ def main(args):
                         node = BeamSearchNode(
                             search, node.emb, node.lstm_out, node.final_hidden,
                             node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
-                            next_word)), node.logp, node.length
+                            next_word)), node.logp, node.length, node.r_square + r_square, args.lambda_reg
                             )
-                        search.add_final(-node.eval(args.alpha), node)
+                        search.add_final(-node.eval(args.alpha)-(j+1)*args.gamma, node)
 
                     # Add the node to current nodes for next iteration
                     else:
                         node = BeamSearchNode(
                             search, node.emb, node.lstm_out, node.final_hidden,
                             node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
-                            next_word)), node.logp + log_p, node.length + 1
+                            next_word)), node.logp + log_p, node.length + 1, node.r_square + r_square, args.lambda_reg
                             )
-                        search.add(-node.eval(args.alpha), node)
+                        search.add(-node.eval(args.alpha)-(j+1)*args.gamma, node)
 
             # #import pdb;pdb.set_trace()
             # __QUESTION 5: What happens internally when we prune our beams?
@@ -194,32 +212,86 @@ def main(args):
             for search in searches:
                 search.prune()
 
-        # Segment into sentences
-        best_sents = torch.stack([search.get_best()[1].sequence[1:].cpu() for search in searches])
-        decoded_batch = best_sents.numpy()
-        #import pdb;pdb.set_trace()
+        if not args.diverse_beam:
+            # Segment into sentences
+            best_sents = torch.stack([search.get_best()[1].sequence[1:].cpu() for search in searches])
+            decoded_batch = best_sents.numpy()
+            #import pdb;pdb.set_trace()
 
-        output_sentences = [decoded_batch[row, :] for row in range(decoded_batch.shape[0])]
+            output_sentences = [decoded_batch[row, :] for row in range(decoded_batch.shape[0])]
 
-        # __QUESTION 6: What is the purpose of this for loop?
-        temp = list()
-        for sent in output_sentences:
-            first_eos = np.where(sent == tgt_dict.eos_idx)[0]
-            if len(first_eos) > 0:
-                temp.append(sent[:first_eos[0]])
-            else:
-                temp.append(sent)
-        output_sentences = temp
+            # __QUESTION 6: What is the purpose of this for loop?
+            temp = list()
+            for sent in output_sentences:
+                first_eos = np.where(sent == tgt_dict.eos_idx)[0]
+                if len(first_eos) > 0:
+                    temp.append(sent[:first_eos[0]])
+                else:
+                    temp.append(sent)
+            output_sentences = temp
 
-        # Convert arrays of indices into strings of words
-        output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
+            # Convert arrays of indices into strings of words
+            output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
 
-        for ii, sent in enumerate(output_sentences):
-            all_hyps[int(sample['id'].data[ii])] = sent
+            for ii, sent in enumerate(output_sentences):
+                all_hyps[int(sample['id'].data[ii])] = sent    
 
+        else:
+            best_n_sents = [[] for _ in range(args.N_best)]
+            decoded_batch = []
+            for i, search in enumerate(searches):
+                best_n = search.get_best_n(args.N_best)
+                for j in range(args.N_best):
+                    best_n_sents[j].append(best_n[j][1].sequence[1:].cpu())
+            
+            for sents in best_n_sents:
+                sents = torch.stack(sents)
+                decoded_batch.append(sents.numpy())
+
+            decoded_batch = np.array(decoded_batch)
+
+            output_sentences_best_n = []
+            for decoded in decoded_batch:
+                output_sentences = []
+                for row in range(decoded.shape[0]):
+                    output_sentences.append(decoded[row, :])
+
+                output_sentences_best_n.append(output_sentences)
+        
+
+            for i, output_sentences in enumerate(output_sentences_best_n):
+                temp = list()
+                for sent in output_sentences:
+                    first_eos = np.where(sent == tgt_dict.eos_idx)[0]
+                    if len(first_eos) > 0:
+                        temp.append(sent[:first_eos[0]])
+                    else:
+                        temp.append(sent)
+                output_sentences = temp
+                output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
+                output_sentences_best_n[i] = output_sentences
+
+            for i, output_sentences in enumerate(output_sentences_best_n):
+                for ii, sent in enumerate(output_sentences):
+                    all_hyps_best_n[i][int(sample['id'].data[ii])] = sent
+        
+
+    if args.output is not None and args.diverse_beam:
+        index = args.output.rfind('/')
+        if index != len(args.output) - 1:
+            output_dict = args.output[:index+1]
+        else:
+            output_dict = args.output
+
+
+        for i, all_hyps in enumerate(all_hyps_best_n):
+            file_name = "test_translations_" + str(i) + ".txt"
+            with open(output_dict + file_name, 'w') as out_file:
+                for sent_id in range(len(all_hyps.keys())):
+                    out_file.write(all_hyps[sent_id] + '\n')
 
     # Write to file
-    if args.output is not None:
+    elif args.output is not None:
         with open(args.output, 'w') as out_file:
             for sent_id in range(len(all_hyps.keys())):
                 out_file.write(all_hyps[sent_id] + '\n')

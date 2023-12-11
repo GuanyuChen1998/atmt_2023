@@ -53,6 +53,27 @@ class BeamSearch(object):
         node = (node[0], node[2])
 
         return node
+    
+    def get_best_n(self, n):
+        """ Returns final nodes with the n lowest negative log probabilities """
+        # Merge EOS paths and those that were stopped by
+        # max sequence length (still in nodes)
+        merged = PriorityQueue()
+        for _ in range(self.final.qsize()):
+            node = self.final.get()
+            merged.put(node)
+
+        for _ in range(self.nodes.qsize()):
+            node = self.nodes.get()
+            merged.put(node)
+        
+        nodes = []
+        for _ in range(n):
+            node = merged.get()
+            node = (node[0], node[2])
+            nodes.append(node)
+
+        return nodes
 
     def prune(self):
         """ Removes all nodes but the beam_size best ones (lowest neg log prob) """
@@ -67,7 +88,8 @@ class BeamSearch(object):
 
 class BeamSearchNode(object):
     """ Defines a search node and stores values important for computation of beam search path"""
-    def __init__(self, search, emb, lstm_out, final_hidden, final_cell, mask, sequence, logProb, length):
+    def __init__(self, search, emb, lstm_out, final_hidden, final_cell, mask, sequence, 
+                 logProb, length, r_square, r_lambda):
 
         # Attributes needed for computation of decoder states
         self.sequence = sequence
@@ -82,6 +104,8 @@ class BeamSearchNode(object):
         self.length = length
 
         self.search = search
+        self.r_square = r_square
+        self.logp = self.logp - r_lambda * self.r_square
 
     def eval(self, alpha=0.0):
         """ Returns score of sequence up to this node 
